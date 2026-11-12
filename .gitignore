@@ -1,0 +1,8 @@
+.streamlit/secrets.toml
+.env
+chats/*.json
+.venv/
+venv/
+Mir/
+__pycache__/
+*.py[cod]
