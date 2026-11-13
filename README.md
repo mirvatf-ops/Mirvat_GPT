@@ -13,7 +13,12 @@ with `openai/gpt-4o-mini`.
   the current session.
 - OpenRouter credentials read from Streamlit secrets or a local environment
   variable.
-- Light and dark appearance using Streamlit's built-in theme menu.
+- Per-chat request and response logs in separate JSON tabs below the
+  conversation (never the API key).
+- Emoji avatars, an empty-chat welcome screen with clickable example prompts,
+  a thinking spinner, and response-time/token captions.
+- An Ocean Breeze color theme, with light and dark appearance available from
+  Streamlit's built-in theme menu.
 
 Chat history is restored after a page refresh from local JSON files. There is
 no database, upload feature, or account system in this starter version.

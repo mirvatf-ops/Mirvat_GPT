@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import time
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ def new_conversation() -> dict[str, Any]:
         "created_at": timestamp,
         "updated_at": timestamp,
         "messages": [],
+        "transactions": [],
     }
 
 
@@ -60,6 +63,17 @@ def load_conversations() -> tuple[dict[str, dict[str, Any]], list[str]]:
             ):
                 raise ValueError("the conversation contains an invalid message")
 
+            transactions = data.get("transactions", [])
+            if not isinstance(transactions, list) or any(
+                not isinstance(transaction, dict)
+                or not isinstance(transaction.get("request"), dict)
+                or not isinstance(transaction.get("response"), str)
+                or not isinstance(transaction.get("status"), str)
+                or not isinstance(transaction.get("timestamp"), str)
+                for transaction in transactions
+            ):
+                raise ValueError("the conversation contains invalid transaction logs")
+
             conversation_id = path.stem.lower()
             conversations[conversation_id] = {
                 "id": conversation_id,
@@ -67,6 +81,7 @@ def load_conversations() -> tuple[dict[str, dict[str, Any]], list[str]]:
                 "created_at": str(data.get("created_at") or now_utc()),
                 "updated_at": str(data.get("updated_at") or now_utc()),
                 "messages": messages,
+                "transactions": transactions,
             }
         except (OSError, json.JSONDecodeError, ValueError) as error:
             errors.append(f"Could not load {path.name}: {error}")
@@ -162,8 +177,38 @@ def delete_active_chat() -> None:
         start_new_chat()
 
 
-def response_text_chunks(stream: Any):
+def capture_usage(source: Any, usage: dict[str, int | None]) -> None:
+    if source is None:
+        return
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = getattr(source, field, None)
+        if isinstance(value, int):
+            usage[field] = value
+
+
+def format_response_metrics(
+    response_time: float,
+    usage: dict[str, int | None] | None,
+) -> str:
+    if usage and isinstance(usage.get("total_tokens"), int):
+        token_summary = f"{usage['total_tokens']} tokens"
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+            token_summary += (
+                f" ({prompt_tokens} prompt + {completion_tokens} completion)"
+            )
+    else:
+        token_summary = "token usage unavailable"
+    return f"Response time: {response_time:.2f}s · {token_summary}"
+
+
+def response_text_chunks(
+    stream: Any,
+    usage: dict[str, int | None],
+) -> Iterator[str]:
     for chunk in stream:
+        capture_usage(getattr(chunk, "usage", None), usage)
         if not chunk.choices:
             continue
         text = chunk.choices[0].delta.content
@@ -179,47 +224,96 @@ def request_reply(
     context_messages: int,
     streaming: bool,
 ) -> None:
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://openrouter.ai/api/v1",
-    )
     messages = [
         {"role": "system", "content": st.session_state.system_prompt},
         *conversation["messages"][-context_messages:],
     ]
+    transaction = {
+        "timestamp": now_utc(),
+        "status": "pending",
+        "request": {
+            "model": MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": streaming,
+        },
+        "response": "",
+    }
+    usage: dict[str, int | None] = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+    }
+    answer = ""
+    request_error: OpenAIError | None = None
+    started_at = time.perf_counter()
 
-    with st.chat_message("assistant"):
-        try:
-            if streaming:
-                stream = client.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=True,
+    with st.chat_message("assistant", avatar="🌊"):
+        with st.spinner("thinking..."):
+            try:
+                client = OpenAI(
+                    api_key=api_key,
+                    base_url="https://openrouter.ai/api/v1",
                 )
-                answer = st.write_stream(response_text_chunks(stream))
-            else:
-                response = client.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                answer = response.choices[0].message.content
-                if not answer:
-                    st.error("The model returned an empty response.")
-                    return
-                st.markdown(answer)
-        except OpenAIError as error:
-            st.error(f"OpenRouter request failed: {error}")
+                if streaming:
+                    stream = client.chat.completions.create(
+                        model=MODEL,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stream=True,
+                        stream_options={"include_usage": True},
+                    )
+                    answer = st.write_stream(response_text_chunks(stream, usage))
+                else:
+                    response = client.chat.completions.create(
+                        model=MODEL,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    answer = response.choices[0].message.content or ""
+                    capture_usage(response.usage, usage)
+                    if answer:
+                        st.markdown(answer)
+            except OpenAIError as error:
+                request_error = error
+
+        elapsed = time.perf_counter() - started_at
+        if request_error:
+            st.error(f"OpenRouter request failed: {request_error}")
+            transaction["status"] = "error"
+            transaction["response"] = "The request failed; see the error above."
+            transaction["response_time_seconds"] = round(elapsed, 2)
+            conversation["transactions"].append(transaction)
+            save_active_conversation()
             return
 
-    if not answer:
-        st.error("The model returned an empty response.")
-        return
+        if not answer:
+            st.error("The model returned an empty response.")
+            transaction["status"] = "empty"
+            transaction["response"] = "The model returned an empty response."
+            transaction["response_time_seconds"] = round(elapsed, 2)
+            conversation["transactions"].append(transaction)
+            save_active_conversation()
+            return
 
-    conversation["messages"].append({"role": "assistant", "content": answer})
+        st.caption(format_response_metrics(elapsed, usage))
+
+    conversation["messages"].append(
+        {
+            "role": "assistant",
+            "content": answer,
+            "response_time_seconds": round(elapsed, 2),
+            "usage": usage,
+        }
+    )
+    transaction["status"] = "completed"
+    transaction["response"] = answer
+    transaction["response_time_seconds"] = round(elapsed, 2)
+    transaction["usage"] = usage
+    conversation["transactions"].append(transaction)
     save_active_conversation()
 
 
@@ -289,11 +383,45 @@ for load_error in st.session_state.chat_load_errors:
 active_conversation = st.session_state.conversations[
     st.session_state.active_chat_id
 ]
+avatar_by_role = {"user": "🧑‍🎓", "assistant": "🌊"}
 for message in active_conversation["messages"]:
-    with st.chat_message(message["role"]):
+    with st.chat_message(
+        message["role"],
+        avatar=avatar_by_role[message["role"]],
+    ):
         st.markdown(message["content"])
+        if message["role"] == "assistant" and isinstance(
+            message.get("response_time_seconds"), (int, float)
+        ):
+            st.caption(
+                format_response_metrics(
+                    message["response_time_seconds"],
+                    message.get("usage"),
+                )
+            )
+
+suggested_prompt = None
+if not active_conversation["messages"]:
+    st.markdown("## Welcome to Mirvat_GPT")
+    st.write("What would you like to learn or work on today?")
+    example_prompts = [
+        "📚 Explain a difficult topic in simple terms",
+        "🗓️ Help me plan a focused study session",
+        "🧠 Quiz me on something I am learning",
+        "✍️ Help me improve a paragraph I wrote",
+    ]
+    prompt_columns = st.columns(2)
+    for index, example in enumerate(example_prompts):
+        if prompt_columns[index % 2].button(
+            example,
+            key=f"example_{active_conversation['id']}_{index}",
+            use_container_width=True,
+        ):
+            suggested_prompt = example
 
 prompt = st.chat_input("Send a message")
+if suggested_prompt:
+    prompt = suggested_prompt
 if prompt:
     user_message = {"role": "user", "content": prompt}
     active_conversation["messages"].append(user_message)
@@ -302,7 +430,7 @@ if prompt:
         if len(prompt.strip()) > 40:
             active_conversation["title"] += "..."
 
-    with st.chat_message("user"):
+    with st.chat_message("user", avatar="🧑‍🎓"):
         st.markdown(prompt)
     save_active_conversation()
 
@@ -321,3 +449,35 @@ if prompt:
             context_messages,
             streaming,
         )
+
+transactions = active_conversation["transactions"]
+with st.expander(f"Transaction logs ({len(transactions)})"):
+    if not transactions:
+        st.caption("No request/response transactions yet.")
+
+    request_tab, response_tab = st.tabs(["Request sent", "Response"])
+    with request_tab:
+        if transactions:
+            for transaction in reversed(transactions):
+                st.json(
+                    {
+                        "timestamp": transaction["timestamp"],
+                        "status": transaction["status"],
+                        "request": transaction["request"],
+                    }
+                )
+        else:
+            st.caption("No requests to display.")
+
+    with response_tab:
+        if transactions:
+            for transaction in reversed(transactions):
+                st.json(
+                    {
+                        "timestamp": transaction["timestamp"],
+                        "status": transaction["status"],
+                        "response": transaction["response"],
+                    }
+                )
+        else:
+            st.caption("No responses to display.")
